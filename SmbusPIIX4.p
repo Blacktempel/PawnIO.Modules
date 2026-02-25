@@ -19,6 +19,8 @@
 
 #include <pawnio.inc>
 
+#include "sleepmode.inc"
+
 // PawnIO PIIX4 Driver
 // Many parts of this was ported from the Linux kernel codebase.
 // See https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/i2c/busses/i2c-piix4.c
@@ -213,11 +215,11 @@ NTSTATUS:piix4_transaction(size)
     // 10 start bits (start + slave address + rd/wr + ack)
     // 9 bits per byte (byte + ack)
     // From datasheet: 'Frequency = 66Mhz/(SmBusTiming * 4)' (we flip the division for the period)
-    microsleep2(((10 + (9 * size)) * timing * 4) / 66);
+    microsleep_long(((10 + (9 * size)) * timing * 4) / 66);
     do {
         // Only check for result once per clock cycle
         // Also allows for 1 stop bit
-        microsleep2((timing * 4) / 66);
+        microsleep_short((timing * 4) / 66);
         temp = io_in_byte(SMBHSTSTS);
     } while ((get_tick_count() < deadline) && (temp & 0x01));
 

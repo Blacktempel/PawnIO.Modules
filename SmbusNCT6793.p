@@ -19,6 +19,8 @@
 
 #include <pawnio.inc>
 
+#include "sleepmode.inc"
+
 // Nuvoton NCT6793D (and compatible) Super IO SMBus Driver
 // Adapted to Windows/PawnIO from my out-of-tree i2c-nct6793 Linux driver
 // See https://gitlab.com/CalcProgrammer1/i2c-nct6793-dkms
@@ -302,7 +304,7 @@ NTSTATUS:nct6793_access(addr, read_write, command, size, in[5], out[5])
                     return STATUS_TIMEOUT;
                 }
 
-                microsleep2(250);
+                microsleep_long(250);
                 timeout++;
             }
 
@@ -338,7 +340,7 @@ NTSTATUS:nct6793_access(addr, read_write, command, size, in[5], out[5])
             return STATUS_TIMEOUT;
         }
 
-        microsleep2(250);
+        microsleep_long(250);
         timeout++;
     }
 

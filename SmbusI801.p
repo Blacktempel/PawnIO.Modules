@@ -19,6 +19,8 @@
 
 #include <pawnio.inc>
 
+#include "sleepmode.inc"
+
 // PawnIO i801 Driver
 // Many parts of this was ported from the Linux kernel codebase.
 // See https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/i2c/busses/i2c-i801.c
@@ -343,11 +345,11 @@ NTSTATUS:i801_wait_intr(&hststs, size)
 
     // 10 start bits (start + slave address + rd/wr + ack)
     // 9 bits per byte (byte + ack)
-    microsleep2((10 + (9 * size)) * clock_us);
+    microsleep_long((10 + (9 * size)) * clock_us);
     do {
         // Only check for result once per clock cycle
         // Also allows for 1 stop bit
-        microsleep2(clock_us);
+        microsleep_short(clock_us);
         hststs = io_in_byte(SMBHSTSTS);
         hststs &= STATUS_ERROR_FLAGS | SMBHSTSTS_INTR;
         if (!(hststs & SMBHSTSTS_HOST_BUSY) && hststs) {
