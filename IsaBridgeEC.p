@@ -51,8 +51,7 @@ const MMIOState: {
     MMIO_Original = -1,
     MMIO_Disabled = 0,
     MMIO_Enabled2E = 1,
-    MMIO_Enabled4E = 2,
-    MMIO_EnabledBoth = 3
+    MMIO_Enabled4E = 2
 };
 
 superio_enter(ioreg) {
@@ -686,7 +685,7 @@ MMIOState:intel_config_to_state(in[IntelConfig], base, base2) {
         case 0: return MMIO_Original;
         case 1: return MMIO_Enabled4E;
         case 2: return MMIO_Enabled2E;
-        case 3: return MMIO_EnabledBoth;
+        case 3: return MMIO_Original; // Supposedly not possible
     }
     return MMIO_Original;
 }
@@ -759,14 +758,6 @@ NTSTATUS:intel_set_state(MMIOState:mmio_state) {
             return STATUS_INVALID_PARAMETER;
         intel_config_make_mask(target, 1, g_superio_2_base, true);
         intel_config_apply_mask(target, config, target);
-    } else if (mmio_state == MMIO_EnabledBoth) {
-        if (g_superio_base == 0 || g_superio_2_base == 0)
-            return STATUS_INVALID_PARAMETER;
-        intel_config_make_mask(target, 0, g_superio_base, true);
-        intel_config_apply_mask(target, config, target);
-        new second_mask[IntelConfig];
-        intel_config_make_mask(second_mask, 1, g_superio_2_base, true);
-        intel_config_apply_mask(target, target, second_mask);
     } else {
         return STATUS_INVALID_PARAMETER;
     }
