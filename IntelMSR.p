@@ -72,6 +72,16 @@ bool:is_allowed_msr_read(msr) {
     return false;
 }
 
+bool:is_allowed_msr_write(msr) {
+    switch (msr) {
+        case MSR_PKG_POWER_LIMIT:
+            return true;
+        default:
+            return false;
+    }
+    return false;
+}
+
 /// Read MSR.
 ///
 /// @param in [0] = MSR
@@ -92,6 +102,22 @@ DEFINE_IOCTL_SIZED(ioctl_read_msr, 1, 1) {
 
     return status;
 }
+
+/// Write MSR.
+///
+/// @param in [0] = MSR, [1] = Value
+/// @param in_size Must be 2
+/// @param out_size Must be 0
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_write_msr, 2, 0) {
+    new msr = in[0] & 0xFFFFFFFF;
+
+    if (!is_allowed_msr_write(msr))
+        return STATUS_ACCESS_DENIED;
+        
+    return msr_write(msr, in[1]);
+}
+
 
 NTSTATUS:main() {
     if (get_arch() != ARCH_X64)
