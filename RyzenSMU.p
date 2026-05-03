@@ -390,6 +390,7 @@ NTSTATUS:get_pm_table_base(&base) {
         case CPU_Colfax, CPU_PinnacleRidge, CPU_SummitRidge, CPU_Naples, CPU_Threadripper: {
             fn[0] = 0x0b;
             fn[1] = 0x0c;
+            fn[2] = 0x0e;
             class = 2;
         }
         case CPU_Dali, CPU_Picasso, CPU_RavenRidge, CPU_RavenRidge2, CPU_FireFlight: {
@@ -417,11 +418,18 @@ NTSTATUS:get_pm_table_base(&base) {
             status = send_command(fn[0], args);
             if (!NT_SUCCESS(status))
                 return status;
+
             args[0] = 0;
             status = send_command(fn[1], args);
             if (!NT_SUCCESS(status))
                 return status;
+
             base = args[0];
+
+            status = send_command(fn[2], args);
+            if (!NT_SUCCESS(status))
+                return status;
+
             return STATUS_SUCCESS;
         }
         case 3: {
