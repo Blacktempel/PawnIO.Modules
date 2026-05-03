@@ -33,6 +33,170 @@
 
 new g_mchbar_addr = 0;
 
+// https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/intel-family.h
+const CodeName: {
+    CPU_UNKNOWN = -1,
+    CPU_SANDYBRIDGE,
+    CPU_SANDYBRIDGE_X,
+    CPU_IVYBRIDGE,
+    CPU_IVYBRIDGE_X,
+    CPU_HASWELL,
+    CPU_HASWELL_X,
+    CPU_HASWELL_L,
+    CPU_HASWELL_G,
+    CPU_BROADWELL,
+    CPU_BROADWELL_G,
+    CPU_BROADWELL_X,
+    CPU_BROADWELL_D,
+    CPU_SKYLAKE_L,
+    CPU_SKYLAKE,
+    CPU_SKYLAKE_X,
+    CPU_KABYLAKE_L,
+    CPU_KABYLAKE,
+    CPU_COMETLAKE,
+    CPU_COMETLAKE_L,
+    CPU_CANNONLAKE_L,
+    CPU_ICELAKE_X,
+    CPU_ICELAKE_D,
+    CPU_ICELAKE,
+    CPU_ICELAKE_L,
+    CPU_ICELAKE_NNPI,
+    CPU_ROCKETLAKE,
+    CPU_TIGERLAKE_L,
+    CPU_TIGERLAKE,
+    CPU_SAPPHIRERAPIDS_X,
+    CPU_EMERALDRAPIDS_X,
+    CPU_GRANITERAPIDS_X,
+    CPU_GRANITERAPIDS_D,
+    CPU_DIAMONDRAPIDS_X,
+    CPU_BARTLETTLAKE,
+    CPU_LAKEFIELD,
+    CPU_ALDERLAKE,
+    CPU_ALDERLAKE_L,
+    CPU_RAPTORLAKE,
+    CPU_RAPTORLAKE_P,
+    CPU_RAPTORLAKE_S,
+    CPU_METEORLAKE,
+    CPU_METEORLAKE_L,
+    CPU_ARROWLAKE_H,
+    CPU_ARROWLAKE,
+    CPU_ARROWLAKE_U,
+    CPU_LUNARLAKE_M,
+    CPU_PANTHERLAKE_L,
+    CPU_WILDCATLAKE_L,
+    CPU_NOVALAKE,
+    CPU_NOVALAKE_L,
+};
+
+CodeName:get_code_name(family, model) {
+    switch ((family << 8) | model) {
+        case 0x062A:
+            return CPU_SANDYBRIDGE;
+        case 0x062D:
+            return CPU_SANDYBRIDGE_X;
+        case 0x063A:
+            return CPU_IVYBRIDGE;
+        case 0x063E:
+            return CPU_IVYBRIDGE_X;
+        case 0x063C:
+            return CPU_HASWELL;
+        case 0x063F:
+            return CPU_HASWELL_X;
+        case 0x0645:
+            return CPU_HASWELL_L;
+        case 0x0646:
+            return CPU_HASWELL_G;
+        case 0x063D:
+            return CPU_BROADWELL;
+        case 0x0647:
+            return CPU_BROADWELL_G;
+        case 0x064F:
+            return CPU_BROADWELL_X;
+        case 0x0656:
+            return CPU_BROADWELL_D;
+        case 0x064E:
+            return CPU_SKYLAKE_L;
+        case 0x065E:
+            return CPU_SKYLAKE;
+        case 0x0655:
+            return CPU_SKYLAKE_X;
+        case 0x068E:
+            return CPU_KABYLAKE_L;
+        case 0x069E:
+            return CPU_KABYLAKE;
+        case 0x06A5:
+            return CPU_COMETLAKE;
+        case 0x06A6:
+            return CPU_COMETLAKE_L;
+        case 0x0666:
+            return CPU_CANNONLAKE_L;
+        case 0x066A:
+            return CPU_ICELAKE_X;
+        case 0x066C:
+            return CPU_ICELAKE_D;
+        case 0x067D:
+            return CPU_ICELAKE;
+        case 0x067E:
+            return CPU_ICELAKE_L;
+        case 0x069D:
+            return CPU_ICELAKE_NNPI;
+        case 0x06A7:
+            return CPU_ROCKETLAKE;
+        case 0x068C:
+            return CPU_TIGERLAKE_L;
+        case 0x068D:
+            return CPU_TIGERLAKE;
+        case 0x068F:
+            return CPU_SAPPHIRERAPIDS_X;
+        case 0x06CF:
+            return CPU_EMERALDRAPIDS_X;
+        case 0x06AD:
+            return CPU_GRANITERAPIDS_X;
+        case 0x06AE:
+            return CPU_GRANITERAPIDS_D;
+        case 0x1901:
+            return CPU_DIAMONDRAPIDS_X;
+        case 0x06D7:
+            return CPU_BARTLETTLAKE;
+        case 0x068A:
+            return CPU_LAKEFIELD;
+        case 0x0697:
+            return CPU_ALDERLAKE;
+        case 0x069A:
+            return CPU_ALDERLAKE_L;
+        case 0x06B7:
+            return CPU_RAPTORLAKE;
+        case 0x06BA:
+            return CPU_RAPTORLAKE_P;
+        case 0x06BF:
+            return CPU_RAPTORLAKE_S;
+        case 0x06AC:
+            return CPU_METEORLAKE;
+        case 0x06AA:
+            return CPU_METEORLAKE_L;
+        case 0x06C5:
+            return CPU_ARROWLAKE_H;
+        case 0x06C6:
+            return CPU_ARROWLAKE;
+        case 0x06B5:
+            return CPU_ARROWLAKE_U;
+        case 0x06BD:
+            return CPU_LUNARLAKE_M;
+        case 0x06CC:
+            return CPU_PANTHERLAKE_L;
+        case 0x06D5:
+            return CPU_WILDCATLAKE_L;
+        case 0x1801:
+            return CPU_NOVALAKE;
+        case 0x1803:
+            return CPU_NOVALAKE_L;
+
+        default:
+            return CPU_UNKNOWN;
+    }
+    return CPU_UNKNOWN;
+}
+
 NTSTATUS:mchbar_init() {
     new didvid;
     new NTSTATUS:status = pci_config_read_dword(0, 0, 0, 0, didvid);
@@ -109,11 +273,34 @@ DEFINE_IOCTL_SIZED(ioctl_read_qword, 1, 1) {
     return status;
 }
 
+/// Get MCHBAR address
+///
+/// @param in Unused
+/// @param in_size Unused
+/// @param out [0] = Address
+/// @param out_size Must be 1
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_get_mchbar_addr, 0, 1) {
+    out[0] = _:g_mchbar_addr;
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS:main() {
     if (get_arch() != ARCH_X64)
         return STATUS_NOT_SUPPORTED;
 
     if (get_cpu_vendor() != CpuVendor_Intel)
+        return STATUS_NOT_SUPPORTED;
+
+    new fms = get_cpu_fms();
+
+    new family = cpu_fms_family(fms);
+    new model = cpu_fms_model(fms);
+
+    debug_print(''IntelMCHBAR: family: %x model: %x\n'', family, model);
+
+    new CodeName:code_name = get_code_name(family, model);
+    if (code_name == CPU_UNKNOWN)
         return STATUS_NOT_SUPPORTED;
 
     return mchbar_init();
