@@ -453,6 +453,56 @@ NTSTATUS:get_pm_table_base(&base) {
 }
 
 new g_table_base;
+new g_table_version;
+new VA:g_table_va = NULL;
+new g_table_size;
+
+unmap_pm_table() {
+    if (g_table_va) {
+        io_space_unmap(g_table_va, g_table_size);
+        g_table_va = NULL;
+    }
+    g_table_size = 0;
+    g_table_base = 0;
+    g_table_version = 0;
+}
+
+NTSTATUS:map_pm_table(table_base) {
+    if (!table_base)
+        return STATUS_INVALID_PARAMETER;
+
+    new VA:table_va = io_space_map(table_base, PAGE_SIZE);
+    if (!table_va)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    g_table_va = table_va;
+    g_table_size = PAGE_SIZE;
+    g_table_base = table_base;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS:init_pm_table() {
+    new version;
+    new NTSTATUS:status = get_pm_table_version(version);
+    if (!NT_SUCCESS(status))
+        return status;
+    debug_print(''RyzenSMU: PM Table Version: %x\n'', version);
+
+    new table_base;
+    status = get_pm_table_base(table_base);
+    if (!NT_SUCCESS(status))
+        return status;
+    debug_print(''RyzenSMU: PM Table Base: %x\n'', table_base);
+
+    if (!g_table_va || g_table_base != table_base) {
+        status = map_pm_table(table_base);
+        if (!NT_SUCCESS(status))
+            return status;
+    }
+
+    g_table_version = version;
+    return STATUS_SUCCESS;
+}
 
 NTSTATUS:check_smu_register_range(cmd) {
     if (cmd < 0 || cmd > 0xFFFFFFFF) return STATUS_NOT_SUPPORTED;
@@ -484,21 +534,12 @@ NTSTATUS:check_smu_register_range(cmd) {
 /// @return An NTSTATUS
 /// @warning You should acquire the "\BaseNamedObjects\Access_PCI" mutant before calling this
 DEFINE_IOCTL_SIZED(ioctl_resolve_pm_table, 0, 2) {
-    new version;
-    new NTSTATUS:status = get_pm_table_version(version);
+    new NTSTATUS:status = init_pm_table();
     if (!NT_SUCCESS(status))
         return status;
-    debug_print(''RyzenSMU: PM Table Version: %x\n'', version);
-    new table_base;
-    status = get_pm_table_base(table_base);
-    if (!NT_SUCCESS(status))
-        return status;
-    debug_print(''RyzenSMU: PM Table Base: %x\n'', table_base);
 
-    g_table_base = table_base;
-
-    out[0] = version;
-    out[1] = table_base;
+    out[0] = g_table_version;
+    out[1] = g_table_base;
 
     return STATUS_SUCCESS;
 }
@@ -525,24 +566,17 @@ DEFINE_IOCTL_SIZED(ioctl_update_pm_table, 0, 0) {
 DEFINE_IOCTL(ioctl_read_pm_table) {
     if (out_size < 1)
         return STATUS_BUFFER_TOO_SMALL;
-    if (!g_table_base)
+    if (!g_table_base || !g_table_va)
         return STATUS_DEVICE_NOT_READY;
-    new read_count = min(out_size, PAGE_SIZE / 8);
-    new read_size = read_count * 8;
-    new VA:va = io_space_map(g_table_base, read_size);
-    new NTSTATUS:status = STATUS_SUCCESS;
-    if (va) {
-        new read;
-        for (new i = 0; i < read_count; ++i) {
-            status = virtual_read_qword(va + i * 8, read);
-            if (!NT_SUCCESS(status))
-                break;
-            out[i] = read;
-        }
 
-        io_space_unmap(va, read_size);
-    } else {
-        status = STATUS_COMMITMENT_LIMIT;
+    new read_count = min(out_size, g_table_size / 8);
+    new NTSTATUS:status = STATUS_SUCCESS;
+    new read;
+    for (new i = 0; i < read_count; ++i) {
+        status = virtual_read_qword(g_table_va + i * 8, read);
+        if (!NT_SUCCESS(status))
+            break;
+        out[i] = read;
     }
 
     return status;
@@ -691,7 +725,7 @@ NTSTATUS:main() {
     debug_print(''RyzenSMU: code_name: %x vid: %x did: %x\n'', _:code_name, didvid & 0xFFFF, (didvid >>> 16) & 0xFFFF);
 
     // sanity check that it's something AMD
-    if (didvid & 0xFFFF != 0x1022)
+    if ((didvid & 0xFFFF) != 0x1022)
         return STATUS_NOT_SUPPORTED;
 
     if (k_addridx[code_name] == -1)
@@ -699,5 +733,14 @@ NTSTATUS:main() {
 
     g_code_name = code_name;
 
+    new NTSTATUS:map_status = init_pm_table();
+    if (!NT_SUCCESS(map_status))
+        return map_status;
+
+    return STATUS_SUCCESS;
+}
+
+public NTSTATUS:unload() {
+    unmap_pm_table();
     return STATUS_SUCCESS;
 }
