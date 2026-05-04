@@ -28,10 +28,9 @@
 
 #define MCHBAREN        0x01
 
-// 128KB
-#define MCHBAR_SIZE     0x20000
-
 new g_mchbar_addr = 0;
+new g_mchbar_size = 0;
+new VA:g_mchbar_va = NULL;
 
 // https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/intel-family.h
 const CodeName: {
@@ -64,13 +63,6 @@ const CodeName: {
     CPU_ROCKETLAKE,
     CPU_TIGERLAKE_L,
     CPU_TIGERLAKE,
-    CPU_SAPPHIRERAPIDS_X,
-    CPU_EMERALDRAPIDS_X,
-    CPU_GRANITERAPIDS_X,
-    CPU_GRANITERAPIDS_D,
-    CPU_DIAMONDRAPIDS_X,
-    CPU_BARTLETTLAKE,
-    CPU_LAKEFIELD,
     CPU_ALDERLAKE,
     CPU_ALDERLAKE_L,
     CPU_RAPTORLAKE,
@@ -146,20 +138,6 @@ CodeName:get_code_name(family, model) {
             return CPU_TIGERLAKE_L;
         case 0x068D:
             return CPU_TIGERLAKE;
-        case 0x068F:
-            return CPU_SAPPHIRERAPIDS_X;
-        case 0x06CF:
-            return CPU_EMERALDRAPIDS_X;
-        case 0x06AD:
-            return CPU_GRANITERAPIDS_X;
-        case 0x06AE:
-            return CPU_GRANITERAPIDS_D;
-        case 0x1901:
-            return CPU_DIAMONDRAPIDS_X;
-        case 0x06D7:
-            return CPU_BARTLETTLAKE;
-        case 0x068A:
-            return CPU_LAKEFIELD;
         case 0x0697:
             return CPU_ALDERLAKE;
         case 0x069A:
@@ -197,7 +175,7 @@ CodeName:get_code_name(family, model) {
     return CPU_UNKNOWN;
 }
 
-NTSTATUS:mchbar_init() {
+NTSTATUS:mchbar_init(CodeName:code_name) {
     new didvid;
     new NTSTATUS:status = pci_config_read_dword(0, 0, 0, 0, didvid);
     if (!NT_SUCCESS(status))
@@ -218,6 +196,17 @@ NTSTATUS:mchbar_init() {
     if (g_mchbar_addr == 0)
         return STATUS_NOT_SUPPORTED;
 
+    if (code_name >= CPU_TIGERLAKE_L)
+        g_mchbar_size = 0x20000; // 128KB
+    else if (code_name >= CPU_ICELAKE_X)
+        g_mchbar_size = 0x10000; // 64KB
+    else
+        g_mchbar_size = 0x8000;  // 32KB
+
+    g_mchbar_va = io_space_map(g_mchbar_addr, g_mchbar_size);
+    if (g_mchbar_va == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
     return STATUS_SUCCESS;
 }
 
@@ -231,17 +220,13 @@ NTSTATUS:mchbar_init() {
 DEFINE_IOCTL_SIZED(ioctl_read_dword, 1, 1) {
     new offset = in[0];
 
-    if (offset >= MCHBAR_SIZE)
+    if (offset >= g_mchbar_size)
         return STATUS_ACCESS_DENIED;
     if (offset & 0x3)
         return STATUS_ACCESS_DENIED;
 
-    new VA:va = io_space_map(g_mchbar_addr + offset, 4);
-    if (va == NULL)
-        return STATUS_INSUFFICIENT_RESOURCES;
     new value = 0;
-    new NTSTATUS:status = virtual_read_dword(va, value);
-    io_space_unmap(va, 4);
+    new NTSTATUS:status = virtual_read_dword(g_mchbar_va + offset, value);
 
     out[0] = value;
     return status;
@@ -257,17 +242,13 @@ DEFINE_IOCTL_SIZED(ioctl_read_dword, 1, 1) {
 DEFINE_IOCTL_SIZED(ioctl_read_qword, 1, 1) {
     new offset = in[0];
 
-    if (offset >= MCHBAR_SIZE)
+    if (offset >= g_mchbar_size)
         return STATUS_ACCESS_DENIED;
     if (offset & 0x7)
         return STATUS_ACCESS_DENIED;
 
-    new VA:va = io_space_map(g_mchbar_addr + offset, 8);
-    if (va == NULL)
-        return STATUS_INSUFFICIENT_RESOURCES;
     new value = 0;
-    new NTSTATUS:status = virtual_read_qword(va, value);
-    io_space_unmap(va, 8);
+    new NTSTATUS:status = virtual_read_qword(g_mchbar_va + offset, value);
 
     out[0] = value;
     return status;
@@ -303,5 +284,10 @@ NTSTATUS:main() {
     if (code_name == CPU_UNKNOWN)
         return STATUS_NOT_SUPPORTED;
 
-    return mchbar_init();
+    return mchbar_init(code_name);
+}
+
+public NTSTATUS:unload() {
+    io_space_unmap(g_mchbar_va, g_mchbar_size);
+    return STATUS_SUCCESS;
 }
