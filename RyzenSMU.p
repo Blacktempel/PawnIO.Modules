@@ -671,23 +671,16 @@ DEFINE_IOCTL_SIZED(ioctl_send_smu_command, 7, 6) {
     if ((in[0] & ~0xFF) != 0)
         return STATUS_NOT_SUPPORTED;
 
-    new args[6];
-    args[0] = in[1];
-    args[1] = in[2];
-    args[2] = in[3];
-    args[3] = in[4];
-    args[4] = in[5];
-    args[5] = in[6];
+    new args[SMU_REQ_MAX_ARGS];
+    for (new i = 0; i < SMU_REQ_MAX_ARGS; ++i)
+        args[i] = in[i + 1];
+
     new NTSTATUS:status = send_command(in[0], args);
     if (!NT_SUCCESS(status))
         return status;
 
-    out[0] = args[0];
-    out[1] = args[1];
-    out[2] = args[2];
-    out[3] = args[3];
-    out[4] = args[4];
-    out[5] = args[5];
+    for (new i = 0; i < SMU_REQ_MAX_ARGS; ++i)
+        out[i] = args[i];
     return STATUS_SUCCESS;
 }
 
