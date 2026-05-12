@@ -473,7 +473,7 @@ NTSTATUS:map_pm_table(table_base) {
 
     new VA:table_va = io_space_map(table_base, PAGE_SIZE);
     if (!table_va)
-        return STATUS_INSUFFICIENT_RESOURCES;
+        return STATUS_COMMITMENT_LIMIT;
 
     g_table_va = table_va;
     g_table_size = PAGE_SIZE;
