@@ -157,6 +157,10 @@ bool:is_port_allowed(port) {
     if (port == g_register_port || port == g_register_port + 1)
         return true;
 
+    // Allow fixed ports 0x25C and 0x25D
+    if (port == 0x25C || port == 0x25D)
+        return true;
+
     // we assume that each BAR is a range of 8 bytes at most
     new port_clamped = port & 0xFFF8;
     new bool:valid = false;
