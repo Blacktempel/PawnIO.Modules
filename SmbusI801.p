@@ -356,7 +356,7 @@ NTSTATUS:i801_wait_intr(&hststs, size)
             hststs &= STATUS_ERROR_FLAGS;
             return STATUS_SUCCESS;
         }
-    } while (((hststs & SMBHSTSTS_HOST_BUSY) || !(hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_INTR))) && (get_tick_count() < deadline));
+    } while (((hststs & SMBHSTSTS_HOST_BUSY) || !(hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_INTR))) && (get_tick_count() < deadline))
 
     if ((hststs & SMBHSTSTS_HOST_BUSY) || !(hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_INTR)))
         return STATUS_IO_TIMEOUT;
@@ -376,6 +376,82 @@ NTSTATUS:i801_transaction(xact, &hststs, size)
     new NTSTATUS:status = i801_wait_intr(hststs, size);
     // restore previous HSTCNT, enabling interrupts if previously enabled
     io_out_byte(SMBHSTCNT, old_hstcnt);
+    return status;
+}
+
+// Wait for a single byte to be transferred in byte-by-byte block mode.
+// Returns STATUS_SUCCESS; hststs is set to the error flags (0 = no error).
+NTSTATUS:i801_wait_byte_done(&hststs)
+{
+    const clock_us = 10; // one clock cycle at 100 kHz
+
+    new deadline = get_tick_count() + MAX_TIMEOUT;
+
+    do {
+        microsleep_short(clock_us);
+        hststs = io_in_byte(SMBHSTSTS);
+    } while ((hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_BYTE_DONE)) == 0 && (get_tick_count() < deadline))
+
+    if ((hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_BYTE_DONE)) == 0)
+        return STATUS_IO_TIMEOUT;
+
+    hststs &= STATUS_ERROR_FLAGS;
+    return STATUS_SUCCESS;
+}
+
+// Byte-by-byte block transaction for I2C_SMBUS_I2C_BLOCK_DATA.
+// Unlike i801_block_transaction_by_block this does NOT use block-buffer mode (E32B).
+// The caller must already have written SMBHSTADD and SMBHSTDAT1 (read offset) or
+// SMBHSTCMD (write offset) before calling this function.
+// in[0]  = number of bytes to transfer
+// in[1..] = bytes to write (write path only)
+// out[0] = number of bytes transferred
+// out[1..] = bytes read (read path only)
+NTSTATUS:i801_i2c_blk_byte_by_byte(read_write, in[33], out[33], &hststs)
+{
+    new NTSTATUS:status = i801_check_pre();
+    if (!NT_SUCCESS(status))
+        return status;
+
+    new len = in[0];
+
+    if (read_write == I2C_SMBUS_WRITE) {
+        io_out_byte(SMBHSTDAT0, len);
+        io_out_byte(SMBBLKDAT, in[1]);
+    }
+
+    new smbcmd;
+    if (read_write == I2C_SMBUS_READ)
+        smbcmd = I801_I2C_BLOCK_DATA;
+    else
+        smbcmd = I801_BLOCK_DATA;
+
+    for (new i = 1; i <= len; i++) {
+        if (i == len && read_write == I2C_SMBUS_READ)
+            smbcmd |= SMBHSTCNT_LAST_BYTE;
+
+        io_out_byte(SMBHSTCNT, smbcmd);
+
+        if (i == 1)
+            io_out_byte(SMBHSTCNT, io_in_byte(SMBHSTCNT) | SMBHSTCNT_START);
+
+        new NTSTATUS:byte_status = i801_wait_byte_done(hststs);
+        if (!NT_SUCCESS(byte_status) || hststs)
+            return i801_hststs_to_ntstatus(hststs);
+
+        if (read_write == I2C_SMBUS_READ)
+            out[i] = io_in_byte(SMBBLKDAT);
+
+        if (read_write == I2C_SMBUS_WRITE && i + 1 <= len)
+            io_out_byte(SMBBLKDAT, in[i + 1]);
+
+        // signal SMBBLKDAT ready
+        io_out_byte(SMBHSTSTS, SMBHSTSTS_BYTE_DONE);
+    }
+
+    out[0] = len;
+
+    status = i801_wait_intr(hststs, len);
     return status;
 }
 
@@ -528,7 +604,17 @@ NTSTATUS:i801_smbus_block_transaction(addr, hstcmd, read_write, command, in[33],
         i801_set_hstadd(addr, I2C_SMBUS_WRITE);
     else
         i801_set_hstadd(addr, read_write);
-    io_out_byte(SMBHSTCMD, hstcmd);
+
+    // For I2C block reads the ICH5 datasheet (p.240) requires the offset/command
+    // byte to be written to SMBHSTDAT1 instead of SMBHSTCMD.
+    if (command == I2C_SMBUS_I2C_BLOCK_DATA && read_write == I2C_SMBUS_READ)
+        io_out_byte(SMBHSTDAT1, hstcmd);
+    else
+        io_out_byte(SMBHSTCMD, hstcmd);
+
+    // I2C block data uses byte-by-byte mode; SMBus block and proc-call use block-buffer mode.
+    if (command == I2C_SMBUS_I2C_BLOCK_DATA)
+        return i801_i2c_blk_byte_by_byte(read_write, in, out, hststs);
 
     // if (priv->features & FEATURE_BLOCK_BUFFER)
     // 	return i801_block_transaction_by_block(data, read_write, command);
@@ -616,7 +702,7 @@ NTSTATUS:i801_access_block(addr, read_write, command, size, in[33], out[33])
     io_out_byte(SMBAUXCTL, io_in_byte(SMBAUXCTL) & (~SMBAUXCTL_CRC));
 
     switch (size) {
-        case I2C_SMBUS_BLOCK_DATA, I2C_SMBUS_BLOCK_PROC_CALL:
+        case I2C_SMBUS_BLOCK_DATA, I2C_SMBUS_BLOCK_PROC_CALL, I2C_SMBUS_I2C_BLOCK_DATA:
             status = i801_smbus_block_transaction(addr, command, read_write, size, in, out, hststs);
         default:
             {
@@ -795,6 +881,48 @@ DEFINE_IOCTL(ioctl_smbus_xfer) {
                 new out_data[I2C_SMBUS_BLOCK_MAX + 1];
 
                 status = i801_access_block(address, read_write, command, hstcmd, unused, out_data);
+
+                if (!NT_SUCCESS(status))
+                    goto getout;
+
+                out[0] = out_data[0];
+                pack_bytes_le(out_data, out, I2C_SMBUS_BLOCK_MAX, 1, 8);
+            }
+        }
+    case I2C_SMBUS_I2C_BLOCK_DATA:
+        {
+            if (read_write == I2C_SMBUS_WRITE) {
+                // 4 parameters + 5 cells of packed data (length byte + up to 32 bytes)
+                if (in_size < (4 + 5)) {
+                    status = STATUS_BUFFER_TOO_SMALL;
+                    goto getout;
+                }
+
+                new in_data[I2C_SMBUS_BLOCK_MAX + 1];
+                unpack_bytes_le(in, in_data, I2C_SMBUS_BLOCK_MAX + 1, 4 * 8, 0);
+
+                new unused[I2C_SMBUS_BLOCK_MAX + 1];
+
+                status = i801_access_block(address, read_write, command, hstcmd, in_data, unused);
+            } else {
+                // read_write == I2C_SMBUS_READ
+                // in[4] = requested byte count (set by caller)
+                if (in_size < 5) {
+                    status = STATUS_BUFFER_TOO_SMALL;
+                    goto getout;
+                }
+
+                if (out_size < 5) {
+                    status = STATUS_BUFFER_TOO_SMALL;
+                    goto getout;
+                }
+
+                new in_data[I2C_SMBUS_BLOCK_MAX + 1];
+                in_data[0] = in[4]; // requested length
+
+                new out_data[I2C_SMBUS_BLOCK_MAX + 1];
+
+                status = i801_access_block(address, read_write, command, hstcmd, in_data, out_data);
 
                 if (!NT_SUCCESS(status))
                     goto getout;

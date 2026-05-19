@@ -672,11 +672,9 @@ DEFINE_IOCTL(ioctl_smbus_xfer) {
                 status = piix4_access_block(address, read_write, command, hstcmd, unused, out_data);
 
                 if (!NT_SUCCESS(status))
-                    return status;
+                    goto getout;
 
                 pack_bytes_le(out_data, out, I2C_SMBUS_BLOCK_MAX + 1);
-
-                return status;
             }
         }
         default:
