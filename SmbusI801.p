@@ -356,7 +356,7 @@ NTSTATUS:i801_wait_intr(&hststs, size)
             hststs &= STATUS_ERROR_FLAGS;
             return STATUS_SUCCESS;
         }
-    } while (((hststs & SMBHSTSTS_HOST_BUSY) || !(hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_INTR))) && (get_tick_count() < deadline))
+    } while (((hststs & SMBHSTSTS_HOST_BUSY) || !(hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_INTR))) && (get_tick_count() < deadline));
 
     if ((hststs & SMBHSTSTS_HOST_BUSY) || !(hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_INTR)))
         return STATUS_IO_TIMEOUT;
@@ -390,7 +390,7 @@ NTSTATUS:i801_wait_byte_done(&hststs)
     do {
         microsleep_short(clock_us);
         hststs = io_in_byte(SMBHSTSTS);
-    } while ((hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_BYTE_DONE)) == 0 && (get_tick_count() < deadline))
+    } while ((hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_BYTE_DONE)) == 0 && (get_tick_count() < deadline));
 
     if ((hststs & (STATUS_ERROR_FLAGS | SMBHSTSTS_BYTE_DONE)) == 0)
         return STATUS_IO_TIMEOUT;
