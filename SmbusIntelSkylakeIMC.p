@@ -28,41 +28,50 @@
 // For reference: https://github.com/Blacktempel/RAMSPDToolkit/
 
 /* i2c_smbus_xfer read or write markers */
-#define I2C_SMBUS_READ	1
-#define I2C_SMBUS_WRITE	0
+#define I2C_SMBUS_READ  1
+#define I2C_SMBUS_WRITE 0
 
-#define I2C_SMBUS_BYTE_DATA		    2
-#define I2C_SMBUS_WORD_DATA		    3
+#define I2C_SMBUS_BYTE_DATA      2
+#define I2C_SMBUS_WORD_DATA      3
+#define I2C_SMBUS_BLOCK_DATA     5
+#define I2C_SMBUS_I2C_BLOCK_DATA 8
+#define I2C_SMBUS_BLOCK_MAX      32
 
 //IMC SMBus Register Layout (offsets from PCI config space of IMC / SMBus device)
-#define REG_STEP 0x04
-#define CMD_BASE 0x9C //Command = CMD_BASE + idx * 4
-#define STS_BASE 0xA8 //Status  = STS_BASE + idx * 4
-#define DAT_BASE 0xB4 //Data    = DAT_BASE + idx * 4
+#define REG_STEP  0x04
+#define CMD_BASE  0x9C //Command = CMD_BASE + idx * 4
+#define STS_BASE  0xA8 //Status  = STS_BASE + idx * 4
+#define DAT_BASE  0xB4 //Data    = DAT_BASE + idx * 4
 //#define TSOD_BASE 0xC0 //Temperature Sensor On DIMM = TSOD_BASE + idx * 4
 
 //Bits in CMD
-#define GO_BIT          0x80000
-#define WORD_BIT        0x20000
-#define PEC_BIT         0x100000 //Unused here
-#define CMD_MASK_KEEP   0xFFE00000 //Keep upper bits from old CMD
-#define SLOT_SHIFT      8
-#define OP_SHIFT        11
+#define WORD_BIT            0x00020000
+#define GO_BIT              0x00080000
+#define TSOD_ACTIVE_BIT     0x00100000
+#define COMMAND_TOGGLE_BIT  0x20000000
+#define COMMAND_KEEP_MASK   0xFFEFFFFF
+#define COMMAND_PREFIX      0x20080000
+#define PAGE_COMMAND        0x2008B6
 
-#define BANK_MASK       0xB000
-#define BANK_0_MASK     0x600
-#define BANK_1_MASK     0x700
+#define SLOT_SHIFT  8
+#define OP_SHIFT    11
 
 //Status bits
-#define STS_BUSY    0x1
-#define STS_ERROR   0x2
+#define STS_BUSY        0x1
+#define STS_ERROR       0x2
+#define STS_DONE_MASK   0x6
+#define STS_DONE_OK     0x4
+#define STS_STATE_MASK  0x7
 
-#define START_RETRIES       5
-#define CMD_DELAY_MS        3
-#define POLL_SLEEP_MS       1
-#define POLL_TIMEOUT_MS     10
+#define START_RETRIES               5
+#define PAGE_STATUS_RETRIES         9999
+#define PAGE_COMMAND_RETRIES        999
+#define TRANSFER_STATUS_RETRIES     99999
+#define TRANSFER_TOGGLE_RETRIES     9999
+
 
 #define MAX_SMBUS_CONTROLLERS 2
+#define ADDRESS_SPACE_8BIT_SIZE 0x100
 
 #define CMD_REG CMD_BASE + smbus_index * REG_STEP
 #define STS_REG STS_BASE + smbus_index * REG_STEP
@@ -102,110 +111,147 @@ NTSTATUS:intel_imc_init()
     return status;
 }
 
-CheckElapsed(start)
+bool:ClearTsodStateIfNeeded(oldCommand)
 {
-    return (get_tick_count()) - start;
-}
-
-bool:WaitReady()
-{
-    new start = get_tick_count();
-
-    while (true)
+    if ((oldCommand & TSOD_ACTIVE_BIT) == 0)
     {
-        new status = 0;
-        pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], STS_REG, status);
+        return true;
+    }
 
-        if ((status & STS_BUSY) == 0)
-        {
-            return true;
-        }
-
-        if (CheckElapsed(start) > POLL_TIMEOUT_MS)
+    new statusReg = 0;
+    for (new i = 0; i < PAGE_STATUS_RETRIES; i++)
+    {
+        new NTSTATUS:status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], STS_REG, statusReg);
+        if (!NT_SUCCESS(status))
         {
             return false;
         }
 
-        microsleep(POLL_SLEEP_MS * 1000);
+        if ((statusReg & STS_BUSY) == 0 && (statusReg & STS_DONE_MASK) != 0)
+        {
+            break;
+        }
     }
+
+    new NTSTATUS:status = pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand & COMMAND_KEEP_MASK);
+    if (!NT_SUCCESS(status))
+    {
+        return false;
+    }
+
+    for (new i = 0; i < PAGE_COMMAND_RETRIES; i++)
+    {
+        new command = 0;
+        status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, command);
+        if (!NT_SUCCESS(status))
+        {
+            return false;
+        }
+
+        if ((command & GO_BIT) == 0)
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
-bool:WaitDone()
+bool:WaitTransferComplete(&lastStatus)
 {
-    new start = get_tick_count();
+    lastStatus = 0;
 
-    while (true)
+    for (new i = 0; i < TRANSFER_STATUS_RETRIES; i++)
     {
-        new lastStatus = 0;
-        pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], STS_REG, lastStatus);
-
-        if ((lastStatus & STS_BUSY) == 0)
+        new NTSTATUS:status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], STS_REG, lastStatus);
+        if (!NT_SUCCESS(status))
         {
-            if ((lastStatus & STS_ERROR) != 0)
+            return false;
+        }
+
+        if ((lastStatus & STS_BUSY) == 0 && (lastStatus & STS_DONE_MASK) != 0)
+        {
+            break;
+        }
+    }
+
+    if ((lastStatus & STS_STATE_MASK) == STS_BUSY)
+    {
+        for (new i = 0; i < TRANSFER_TOGGLE_RETRIES; i++)
+        {
+            new command = 0;
+            new NTSTATUS:status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, command);
+            if (!NT_SUCCESS(status))
             {
                 return false;
             }
 
-            return true;
+            status = pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, command ^ COMMAND_TOGGLE_BIT);
+            if (!NT_SUCCESS(status))
+            {
+                return false;
+            }
+
+            status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], STS_REG, lastStatus);
+            if (!NT_SUCCESS(status))
+            {
+                return false;
+            }
+
+            if ((lastStatus & STS_STATE_MASK) == STS_BUSY)
+            {
+                break;
+            }
         }
 
-        if (CheckElapsed(start) > POLL_TIMEOUT_MS)
+        for (new i = 0; i < TRANSFER_TOGGLE_RETRIES; i++)
         {
-            return false;
-        }
+            new NTSTATUS:status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], STS_REG, lastStatus);
+            if (!NT_SUCCESS(status))
+            {
+                return false;
+            }
 
-        microsleep(POLL_SLEEP_MS * 1000);
+            if ((lastStatus & STS_BUSY) == 0 && (lastStatus & STS_DONE_MASK) != 0)
+            {
+                break;
+            }
+        }
     }
+
+    return (lastStatus & STS_DONE_MASK) == STS_DONE_OK;
 }
 
-/// SMBus transfer.
-///
-/// Performs a transfer of data over the SMBus using the specified command.
-/// I2C_SMBUS_BYTE_DATA (2)
-/// I2C_SMBUS_WORD_DATA (3)
-///
-/// @param in [0] = Address/Offset, [1] = Read(1)/Write(0), [2] = Command (Opcode & Slot), [3] = Protocol
-/// @param in_size Must be 4
-/// @param out [0] = Data
-/// @param out_size Must be 1
-/// @return An NTSTATUS
-/// @warning You should acquire the "\BaseNamedObjects\Access_SMBUS.HTP.Method" mutant before calling this
-DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 4, 1)
+NTSTATUS:ReadImcData(offset, read_write, opcode, slot, hstcmd, &value)
 {
-    new offset = in[0];
-    new read_write = in[1];
-    new command = in[2];
-    new hstcmd = in[3];
-
-    new NTSTATUS:status;
-
     if (hstcmd != I2C_SMBUS_BYTE_DATA
      && hstcmd != I2C_SMBUS_WORD_DATA)
     {
         debug_print(''Unsupported transaction %d\n'', hstcmd);
-        status = STATUS_NOT_SUPPORTED;
+        return STATUS_NOT_SUPPORTED;
     }
 
     if (read_write == I2C_SMBUS_WRITE)
     {
         debug_print(''Write is unsupported %d\n'', read_write);
-        status = STATUS_NOT_SUPPORTED;
+        return STATUS_NOT_SUPPORTED;
     }
 
-    new opcode = command >> 4;
-    new slot = command & 0x0F;
-
-    for (new i; i < START_RETRIES; i++)
+    for (new i = 0; i < START_RETRIES; i++)
     {
-        if (!WaitReady())
+        new oldCommand = 0;
+        new NTSTATUS:status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
+        if (!NT_SUCCESS(status))
+        {
+            return status;
+        }
+
+        if (!ClearTsodStateIfNeeded(oldCommand))
         {
             continue;
         }
 
-        new oldCommand = 0;
-        status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
-
-        new cmd = (oldCommand & CMD_MASK_KEEP)
+        new cmd = COMMAND_PREFIX
                 | ((opcode & 0xF) << OP_SHIFT)
                 | ((slot & 0x7) << SLOT_SHIFT)
                 | offset;
@@ -215,43 +261,123 @@ DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 4, 1)
             cmd |= WORD_BIT;
         }
 
-        cmd |= GO_BIT;
-
         status = pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, cmd);
-        microsleep(CMD_DELAY_MS * 1000);
+        if (!NT_SUCCESS(status))
+        {
+            return status;
+        }
 
-        if (WaitDone())
+        new lastStatus = 0;
+        if (WaitTransferComplete(lastStatus))
         {
             new dataReg = 0;
             status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], DAT_REG, dataReg);
+            pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
+
+            if (!NT_SUCCESS(status))
+            {
+                return status;
+            }
 
             switch (hstcmd)
             {
                 case I2C_SMBUS_BYTE_DATA:
                 {
-                    out[0] = dataReg & 0xFF;
+                    value = dataReg & 0xFF;
                     return STATUS_SUCCESS;
                 }
                 case I2C_SMBUS_WORD_DATA:
                 {
                     //Swap high / low
-                    out[0] = ((dataReg & 0xFF00) >> 8) | ((dataReg & 0x00FF) << 8);
+                    value = ((dataReg & 0xFF00) >> 8) | ((dataReg & 0x00FF) << 8);
                     return STATUS_SUCCESS;
-                }
-                default:
-                {
-                    debug_print(''Unsupported transaction %d\n'', hstcmd);
-                    status = STATUS_NOT_SUPPORTED;
                 }
             }
         }
 
-        microsleep(CMD_DELAY_MS * 1000);
+        pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
     }
 
-    status = STATUS_NOT_SUPPORTED;
+    return STATUS_DEVICE_BUSY;
+}
 
-    return status;
+/// SMBus transfer.
+///
+/// Performs a transfer of data over the SMBus using the specified command.
+/// I2C_SMBUS_BYTE_DATA (2)
+/// I2C_SMBUS_WORD_DATA (3)
+/// I2C_SMBUS_BLOCK_DATA (5)
+/// I2C_SMBUS_I2C_BLOCK_DATA (8)
+///
+/// @param in [0] = Address/Offset, [1] = Read(1)/Write(0), [2] = Command (Opcode & Slot), [3] = Protocol, [4] = Requested block length for block reads
+/// @param in_size Must be 5
+/// @param out [0] = Data for byte/word reads or block length for block reads, [1..4] = Packed block data bytes
+/// @param out_size Must be 5
+/// @return An NTSTATUS
+/// @warning You should acquire the "\BaseNamedObjects\Access_SMBUS.HTP.Method" mutant before calling this
+DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
+{
+    new offset = in[0];
+    new read_write = in[1];
+    new command = in[2];
+    new hstcmd = in[3];
+    new length = in[4];
+
+    new opcode = command >> 4;
+    new slot = command & 0x0F;
+
+    if (hstcmd == I2C_SMBUS_BLOCK_DATA
+     || hstcmd == I2C_SMBUS_I2C_BLOCK_DATA)
+    {
+        if (read_write != I2C_SMBUS_READ)
+        {
+            debug_print(''Write block read request is unsupported %d\n'', read_write);
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        if (length <= 0 || length > I2C_SMBUS_BLOCK_MAX)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        if (offset + length > ADDRESS_SPACE_8BIT_SIZE)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        out[0] = 0;
+        out[1] = 0;
+        out[2] = 0;
+        out[3] = 0;
+        out[4] = 0;
+
+        for (new index = 0; index < length; index++)
+        {
+            new value = 0;
+            new NTSTATUS:status = ReadImcData(offset + index, I2C_SMBUS_READ, opcode, slot, I2C_SMBUS_BYTE_DATA, value);
+            if (!NT_SUCCESS(status))
+            {
+                return status;
+            }
+
+            new cellIndex = index / 8;
+            new byteOffset = index % 8;
+            out[1 + cellIndex] |= (value & 0xFF) << (byteOffset * 8);
+            out[0] = index + 1;
+        }
+
+        return STATUS_SUCCESS;
+    }
+
+    new value = 0;
+    new NTSTATUS:status = ReadImcData(offset, read_write, opcode, slot, hstcmd, value);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    out[0] = value;
+    return STATUS_SUCCESS;
 }
 
 /// Set the bank index.
@@ -270,33 +396,52 @@ DEFINE_IOCTL_SIZED(ioctl_set_bank, 1, 0)
         return STATUS_NO_SUCH_DEVICE;
     }
 
-    for (new i; i < START_RETRIES; i++)
+    for (new i = 0; i < START_RETRIES; i++)
     {
-        if (!WaitReady())
+        new oldCommand = 0;
+        new NTSTATUS:status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
+        if (!NT_SUCCESS(status))
+        {
+            return status;
+        }
+
+        if (!ClearTsodStateIfNeeded(oldCommand))
         {
             continue;
         }
 
-        new oldCommand = 0;
-        new NTSTATUS:status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
-
-        new bankIndexMask = bankIndex == 0 ? BANK_0_MASK : BANK_1_MASK;
-        new cmd = (oldCommand & CMD_MASK_KEEP)
-                | BANK_MASK
-                | bankIndexMask
-                | GO_BIT;
+        new cmd = ((bankIndex & 1) | PAGE_COMMAND) << 8;
 
         status = pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, cmd);
-        microsleep(CMD_DELAY_MS * 1000);
-
-        if (WaitDone())
+        if (!NT_SUCCESS(status))
         {
-            debug_print(''Set Bank index to %d\n'', bankIndex);
-
             return status;
         }
 
-        microsleep(CMD_DELAY_MS * 1000);
+        new lastStatus = 0;
+        new bool:completed = false;
+        for (new j = 0; j < PAGE_STATUS_RETRIES; j++)
+        {
+            status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], STS_REG, lastStatus);
+            if (!NT_SUCCESS(status))
+            {
+                break;
+            }
+
+            if ((lastStatus & 0x03) != STS_BUSY)
+            {
+                completed = true;
+                break;
+            }
+        }
+
+        pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
+
+        if (completed)
+        {
+            debug_print(''Set Bank index to %d\n'', bankIndex);
+            return STATUS_SUCCESS;
+        }
     }
 
     return STATUS_DEVICE_BUSY;
