@@ -25,6 +25,8 @@
 #define MSR_IA32_THERM_STATUS		0x0000019c
 
 #define MSR_VR_CURRENT_CONFIG		0x00000601
+#define MSR_VR_MAILBOX_INTERFACE    0x00000607
+#define MSR_VR_MAILBOX_DATA         0x00000608
 #define MSR_PKG_POWER_LIMIT		0x00000610
 #define MSR_PKG_ENERGY_STATUS		0x00000611
 #define MSR_PKG_PERF_STATUS		0x00000613
@@ -59,9 +61,7 @@
 #define MSR_IA32_MPERF			0x000000e7
 #define MSR_IA32_APERF			0x000000e8
 
-#define OC_MAILBOX_MSR              0x00000150
-#define VR_MAILBOX_MSR_INTERFACE    0x00000607
-#define VR_MAILBOX_MSR_DATA         0x00000608
+#define MSR_OC_MAILBOX          0x00000150
 
 bool:is_allowed_msr_read(msr) {
     switch (msr) {
@@ -73,7 +73,7 @@ bool:is_allowed_msr_read(msr) {
             MSR_PP0_POWER_LIMIT, MSR_PP0_ENERGY_STATUS, MSR_PP0_POLICY, MSR_PP0_PERF_STATUS,
             MSR_PP1_POWER_LIMIT, MSR_PP1_ENERGY_STATUS, MSR_PP1_POLICY,
             MSR_PLATFORM_ENERGY_STATUS, MSR_RAPL_POWER_UNIT, MSR_PLATFORM_INFO,
-            MSR_EBL_CR_POWERON, MSR_TURBO_RATIO_LIMIT, OC_MAILBOX_MSR, VR_MAILBOX_MSR_INTERFACE, VR_MAILBOX_MSR_DATA:
+            MSR_EBL_CR_POWERON, MSR_TURBO_RATIO_LIMIT, MSR_OC_MAILBOX, MSR_VR_MAILBOX_INTERFACE, MSR_VR_MAILBOX_DATA:
             return true;
         default:
             return false;
@@ -83,7 +83,7 @@ bool:is_allowed_msr_read(msr) {
 
 bool:is_allowed_msr_write(msr) {
     switch (msr) {
-        case MSR_VR_CURRENT_CONFIG, MSR_PKG_POWER_LIMIT, OC_MAILBOX_MSR, VR_MAILBOX_MSR_INTERFACE, VR_MAILBOX_MSR_DATA:
+        case MSR_VR_CURRENT_CONFIG, MSR_PKG_POWER_LIMIT, MSR_OC_MAILBOX, MSR_VR_MAILBOX_INTERFACE, MSR_VR_MAILBOX_DATA:
             return true;
         default:
             return false;
