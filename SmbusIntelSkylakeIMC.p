@@ -31,6 +31,8 @@
 #define I2C_SMBUS_READ  1
 #define I2C_SMBUS_WRITE 0
 
+#define I2C_SMBUS_QUICK          0
+#define I2C_SMBUS_BYTE           1
 #define I2C_SMBUS_BYTE_DATA      2
 #define I2C_SMBUS_WORD_DATA      3
 #define I2C_SMBUS_BLOCK_DATA     5
@@ -72,6 +74,14 @@
 
 #define MAX_SMBUS_CONTROLLERS 2
 #define ADDRESS_SPACE_8BIT_SIZE 0x100
+
+#define SPD_BEGIN              0x50
+#define SPD_END                0x57
+#define SPD_DDR4_ADDRESS_PAGE  0x36
+#define SPD_OPCODE             0x0A
+#define TSOD_OPCODE            0x03
+#define DDR4_TSOD_BEGIN        0x18
+#define DDR4_TSOD_END          0x1F
 
 #define CMD_REG CMD_BASE + smbus_index * REG_STEP
 #define STS_REG STS_BASE + smbus_index * REG_STEP
@@ -222,6 +232,112 @@ bool:WaitTransferComplete(&lastStatus)
     return (lastStatus & STS_DONE_MASK) == STS_DONE_OK;
 }
 
+bool:IsSPDDeviceAddress(addr)
+{
+    return addr >= SPD_BEGIN && addr <= SPD_END;
+}
+
+bool:IsDDR4PageSelectorAddress(addr)
+{
+    return addr == SPD_DDR4_ADDRESS_PAGE || addr == SPD_DDR4_ADDRESS_PAGE + 1;
+}
+
+bool:IsDDR4TSODAddress(addr)
+{
+    return addr >= DDR4_TSOD_BEGIN && addr <= DDR4_TSOD_END;
+}
+
+NTSTATUS:PrepareImcTransfer(addr, command, hstcmd, &offset, &opcode, &slot)
+{
+    offset = 0;
+    opcode = 0;
+    slot = 0;
+
+    if (hstcmd != I2C_SMBUS_BYTE_DATA
+     && hstcmd != I2C_SMBUS_WORD_DATA)
+    {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    if (hstcmd == I2C_SMBUS_WORD_DATA && IsDDR4TSODAddress(addr))
+    {
+        offset = command & 0xFF;
+        opcode = TSOD_OPCODE;
+        slot = addr & 0x07;
+
+        return STATUS_SUCCESS;
+    }
+
+    if (hstcmd == I2C_SMBUS_BYTE_DATA && IsSPDDeviceAddress(addr))
+    {
+        offset = command & 0xFF;
+        opcode = SPD_OPCODE;
+        slot = addr & 0x07;
+
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS:SetBankCore(bankIndex)
+{
+    if (bankIndex < 0 || bankIndex > 1)
+    {
+        return STATUS_NO_SUCH_DEVICE;
+    }
+
+    for (new i = 0; i < START_RETRIES; i++)
+    {
+        new oldCommand = 0;
+        new NTSTATUS:status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
+        if (!NT_SUCCESS(status))
+        {
+            return status;
+        }
+
+        if (!ClearTsodStateIfNeeded(oldCommand))
+        {
+            continue;
+        }
+
+        new cmd = ((bankIndex & 1) | PAGE_COMMAND) << 8;
+
+        status = pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, cmd);
+        if (!NT_SUCCESS(status))
+        {
+            return status;
+        }
+
+        new lastStatus = 0;
+        new bool:completed = false;
+        for (new j = 0; j < PAGE_STATUS_RETRIES; j++)
+        {
+            status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], STS_REG, lastStatus);
+            if (!NT_SUCCESS(status))
+            {
+                break;
+            }
+
+            if ((lastStatus & 0x03) != STS_BUSY)
+            {
+                completed = true;
+                break;
+            }
+        }
+
+        pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
+
+        if (completed)
+        {
+            debug_print(''Set Bank index to %d\n'', bankIndex);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    return STATUS_DEVICE_BUSY;
+}
+
 NTSTATUS:ReadImcData(offset, read_write, opcode, slot, hstcmd, &value)
 {
     if (hstcmd != I2C_SMBUS_BYTE_DATA
@@ -309,7 +425,7 @@ NTSTATUS:ReadImcData(offset, read_write, opcode, slot, hstcmd, &value)
 /// I2C_SMBUS_BLOCK_DATA (5)
 /// I2C_SMBUS_I2C_BLOCK_DATA (8)
 ///
-/// @param in [0] = Address/Offset, [1] = Read(1)/Write(0), [2] = Command (Opcode & Slot), [3] = Protocol, [4] = Requested block length for block reads
+/// @param in [0] = SMBus address, [1] = Read(1)/Write(0), [2] = Command/register offset, [3] = Protocol, [4] = Requested block length for block reads
 /// @param in_size Must be 5
 /// @param out [0] = Data for byte/word reads or block length for block reads, [1..4] = Packed block data bytes
 /// @param out_size Must be 5
@@ -317,14 +433,26 @@ NTSTATUS:ReadImcData(offset, read_write, opcode, slot, hstcmd, &value)
 /// @warning You should acquire the "\BaseNamedObjects\Access_SMBUS.HTP.Method" mutant before calling this
 DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
 {
-    new offset = in[0];
+    new addr = in[0];
     new read_write = in[1];
     new command = in[2];
     new hstcmd = in[3];
     new length = in[4];
 
-    new opcode = command >> 4;
-    new slot = command & 0x0F;
+    if (IsDDR4PageSelectorAddress(addr))
+    {
+        if (read_write != I2C_SMBUS_WRITE)
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        if (hstcmd == I2C_SMBUS_QUICK || hstcmd == I2C_SMBUS_BYTE_DATA)
+        {
+            return SetBankCore(addr - SPD_DDR4_ADDRESS_PAGE);
+        }
+
+        return STATUS_NOT_SUPPORTED;
+    }
 
     if (hstcmd == I2C_SMBUS_BLOCK_DATA
      || hstcmd == I2C_SMBUS_I2C_BLOCK_DATA)
@@ -340,7 +468,7 @@ DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
             return STATUS_INVALID_PARAMETER;
         }
 
-        if (offset + length > ADDRESS_SPACE_8BIT_SIZE)
+        if (command + length > ADDRESS_SPACE_8BIT_SIZE)
         {
             return STATUS_INVALID_PARAMETER;
         }
@@ -353,8 +481,18 @@ DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
 
         for (new index = 0; index < length; index++)
         {
+            new offset = 0;
+            new opcode = 0;
+            new slot = 0;
+
+            new NTSTATUS:status = PrepareImcTransfer(addr, command + index, I2C_SMBUS_BYTE_DATA, offset, opcode, slot);
+            if (!NT_SUCCESS(status))
+            {
+                return status;
+            }
+
             new value = 0;
-            new NTSTATUS:status = ReadImcData(offset + index, I2C_SMBUS_READ, opcode, slot, I2C_SMBUS_BYTE_DATA, value);
+            status = ReadImcData(offset, I2C_SMBUS_READ, opcode, slot, I2C_SMBUS_BYTE_DATA, value);
             if (!NT_SUCCESS(status))
             {
                 return status;
@@ -362,6 +500,7 @@ DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
 
             new cellIndex = index / 8;
             new byteOffset = index % 8;
+
             out[1 + cellIndex] |= (value & 0xFF) << (byteOffset * 8);
             out[0] = index + 1;
         }
@@ -369,8 +508,17 @@ DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
         return STATUS_SUCCESS;
     }
 
+    new offset = 0;
+    new opcode = 0;
+    new slot = 0;
+    new NTSTATUS:status = PrepareImcTransfer(addr, command, hstcmd, offset, opcode, slot);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
     new value = 0;
-    new NTSTATUS:status = ReadImcData(offset, read_write, opcode, slot, hstcmd, value);
+    status = ReadImcData(offset, read_write, opcode, slot, hstcmd, value);
     if (!NT_SUCCESS(status))
     {
         return status;
@@ -389,62 +537,7 @@ DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
 /// @return An NTSTATUS
 DEFINE_IOCTL_SIZED(ioctl_set_bank, 1, 0)
 {
-    new bankIndex = in[0];
-
-    if (bankIndex < 0 || bankIndex > 1)
-    {
-        return STATUS_NO_SUCH_DEVICE;
-    }
-
-    for (new i = 0; i < START_RETRIES; i++)
-    {
-        new oldCommand = 0;
-        new NTSTATUS:status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
-        if (!NT_SUCCESS(status))
-        {
-            return status;
-        }
-
-        if (!ClearTsodStateIfNeeded(oldCommand))
-        {
-            continue;
-        }
-
-        new cmd = ((bankIndex & 1) | PAGE_COMMAND) << 8;
-
-        status = pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, cmd);
-        if (!NT_SUCCESS(status))
-        {
-            return status;
-        }
-
-        new lastStatus = 0;
-        new bool:completed = false;
-        for (new j = 0; j < PAGE_STATUS_RETRIES; j++)
-        {
-            status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], STS_REG, lastStatus);
-            if (!NT_SUCCESS(status))
-            {
-                break;
-            }
-
-            if ((lastStatus & 0x03) != STS_BUSY)
-            {
-                completed = true;
-                break;
-            }
-        }
-
-        pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
-
-        if (completed)
-        {
-            debug_print(''Set Bank index to %d\n'', bankIndex);
-            return STATUS_SUCCESS;
-        }
-    }
-
-    return STATUS_DEVICE_BUSY;
+    return SetBankCore(in[0]);
 }
 
 /// Identify the SMBus controller.
@@ -458,7 +551,7 @@ DEFINE_IOCTL_SIZED(ioctl_identity, 0, 3)
 {
     new NTSTATUS:status;
 
-    out[0] = CHAR8_CONST('I', 'n', 't', 'e', 'l', 'P', 'C', 'U');
+    out[0] = CHAR8_CONST('I', 'n', 't', 'e', 'l', 'I', 'M', 'C');
 
     out[1] = 0;
 
