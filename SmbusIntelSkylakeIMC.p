@@ -48,6 +48,7 @@
 
 //Bits in CMD
 #define WORD_BIT            0x00020000
+#define WRITE_OPERATION     0x00008000
 #define GO_BIT              0x00080000
 #define TSOD_ACTIVE_BIT     0x00100000
 #define COMMAND_TOGGLE_BIT  0x20000000
@@ -61,8 +62,9 @@
 //Status bits
 #define STS_BUSY        0x1
 #define STS_ERROR       0x2
-#define STS_DONE_MASK   0x6
-#define STS_DONE_OK     0x4
+#define STS_READ_DONE   0x4
+#define STS_WRITE_DONE  0x8
+#define STS_ANY_DONE    (STS_ERROR | STS_READ_DONE | STS_WRITE_DONE)
 #define STS_STATE_MASK  0x7
 
 #define START_RETRIES               5
@@ -137,7 +139,7 @@ bool:ClearTsodStateIfNeeded(oldCommand)
             return false;
         }
 
-        if ((statusReg & STS_BUSY) == 0 && (statusReg & STS_DONE_MASK) != 0)
+        if ((statusReg & STS_BUSY) == 0 && (statusReg & STS_ANY_DONE) != 0)
         {
             break;
         }
@@ -167,9 +169,11 @@ bool:ClearTsodStateIfNeeded(oldCommand)
     return false;
 }
 
-bool:WaitTransferComplete(&lastStatus)
+bool:WaitTransferComplete(expectedDoneBit, &lastStatus)
 {
     lastStatus = 0;
+
+    new doneMask = STS_ERROR | expectedDoneBit;
 
     for (new i = 0; i < TRANSFER_STATUS_RETRIES; i++)
     {
@@ -179,7 +183,7 @@ bool:WaitTransferComplete(&lastStatus)
             return false;
         }
 
-        if ((lastStatus & STS_BUSY) == 0 && (lastStatus & STS_DONE_MASK) != 0)
+        if ((lastStatus & STS_BUSY) == 0 && (lastStatus & doneMask) != 0)
         {
             break;
         }
@@ -222,14 +226,14 @@ bool:WaitTransferComplete(&lastStatus)
                 return false;
             }
 
-            if ((lastStatus & STS_BUSY) == 0 && (lastStatus & STS_DONE_MASK) != 0)
+            if ((lastStatus & STS_BUSY) == 0 && (lastStatus & doneMask) != 0)
             {
                 break;
             }
         }
     }
 
-    return (lastStatus & STS_DONE_MASK) == STS_DONE_OK;
+    return (lastStatus & doneMask) == expectedDoneBit;
 }
 
 bool:IsSPDDeviceAddress(addr)
@@ -338,7 +342,7 @@ NTSTATUS:SetBankCore(bankIndex)
     return STATUS_DEVICE_BUSY;
 }
 
-NTSTATUS:ReadImcData(offset, read_write, opcode, slot, hstcmd, &value)
+NTSTATUS:ImcAccess(offset, read_write, opcode, slot, hstcmd, &value)
 {
     if (hstcmd != I2C_SMBUS_BYTE_DATA
      && hstcmd != I2C_SMBUS_WORD_DATA)
@@ -347,10 +351,9 @@ NTSTATUS:ReadImcData(offset, read_write, opcode, slot, hstcmd, &value)
         return STATUS_NOT_SUPPORTED;
     }
 
-    if (read_write == I2C_SMBUS_WRITE)
+    if (read_write != I2C_SMBUS_READ && read_write != I2C_SMBUS_WRITE)
     {
-        debug_print(''Write is unsupported %d\n'', read_write);
-        return STATUS_NOT_SUPPORTED;
+        return STATUS_INVALID_PARAMETER;
     }
 
     for (new i = 0; i < START_RETRIES; i++)
@@ -377,6 +380,24 @@ NTSTATUS:ReadImcData(offset, read_write, opcode, slot, hstcmd, &value)
             cmd |= WORD_BIT;
         }
 
+        if (read_write == I2C_SMBUS_WRITE)
+        {
+            new writeData = value & 0xFF;
+
+            if (hstcmd == I2C_SMBUS_WORD_DATA)
+            {
+                writeData = ((value & 0xFF00) >> 8) | ((value & 0x00FF) << 8);
+            }
+
+            status = pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], DAT_REG, writeData << 16);
+            if (!NT_SUCCESS(status))
+            {
+                return status;
+            }
+
+            cmd |= WRITE_OPERATION;
+        }
+
         status = pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, cmd);
         if (!NT_SUCCESS(status))
         {
@@ -384,8 +405,15 @@ NTSTATUS:ReadImcData(offset, read_write, opcode, slot, hstcmd, &value)
         }
 
         new lastStatus = 0;
-        if (WaitTransferComplete(lastStatus))
+        new expectedDoneBit = read_write == I2C_SMBUS_WRITE ? STS_WRITE_DONE : STS_READ_DONE;
+        if (WaitTransferComplete(expectedDoneBit, lastStatus))
         {
+            if (read_write == I2C_SMBUS_WRITE)
+            {
+                pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
+                return STATUS_SUCCESS;
+            }
+
             new dataReg = 0;
             status = pci_config_read_dword(pci_address[0], pci_address[1], pci_address[2], DAT_REG, dataReg);
             pci_config_write_dword(pci_address[0], pci_address[1], pci_address[2], CMD_REG, oldCommand);
@@ -425,13 +453,13 @@ NTSTATUS:ReadImcData(offset, read_write, opcode, slot, hstcmd, &value)
 /// I2C_SMBUS_BLOCK_DATA (5)
 /// I2C_SMBUS_I2C_BLOCK_DATA (8)
 ///
-/// @param in [0] = SMBus address, [1] = Read(1)/Write(0), [2] = Command/register offset, [3] = Protocol, [4] = Requested block length for block reads
-/// @param in_size Must be 5
+/// @param in [0] = SMBus address, [1] = Read(1)/Write(0), [2] = Command/register offset, [3] = Protocol, [4] = Block length, [5..8] = Packed block write data bytes
+/// @param in_size Must be 9
 /// @param out [0] = Data for byte/word reads or block length for block reads, [1..4] = Packed block data bytes
 /// @param out_size Must be 5
 /// @return An NTSTATUS
 /// @warning You should acquire the "\BaseNamedObjects\Access_SMBUS.HTP.Method" mutant before calling this
-DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
+DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 9, 5)
 {
     new addr = in[0];
     new read_write = in[1];
@@ -457,10 +485,9 @@ DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
     if (hstcmd == I2C_SMBUS_BLOCK_DATA
      || hstcmd == I2C_SMBUS_I2C_BLOCK_DATA)
     {
-        if (read_write != I2C_SMBUS_READ)
+        if (read_write != I2C_SMBUS_READ && read_write != I2C_SMBUS_WRITE)
         {
-            debug_print(''Write block read request is unsupported %d\n'', read_write);
-            return STATUS_NOT_SUPPORTED;
+            return STATUS_INVALID_PARAMETER;
         }
 
         if (length <= 0 || length > I2C_SMBUS_BLOCK_MAX)
@@ -492,17 +519,34 @@ DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
             }
 
             new value = 0;
-            status = ReadImcData(offset, I2C_SMBUS_READ, opcode, slot, I2C_SMBUS_BYTE_DATA, value);
-            if (!NT_SUCCESS(status))
+
+            if (read_write == I2C_SMBUS_READ)
             {
-                return status;
+                status = ImcAccess(offset, I2C_SMBUS_READ, opcode, slot, I2C_SMBUS_BYTE_DATA, value);
+                if (!NT_SUCCESS(status))
+                {
+                    return status;
+                }
+
+                new cellIndex = index / 8;
+                new byteOffset = index % 8;
+
+                out[1 + cellIndex] |= (value & 0xFF) << (byteOffset * 8);
+                out[0] = index + 1;
             }
+            else
+            {
+                new cellIndex = index / 8;
+                new byteOffset = index % 8;
 
-            new cellIndex = index / 8;
-            new byteOffset = index % 8;
+                value = (in[5 + cellIndex] >> (byteOffset * 8)) & 0xFF;
 
-            out[1 + cellIndex] |= (value & 0xFF) << (byteOffset * 8);
-            out[0] = index + 1;
+                status = ImcAccess(offset, I2C_SMBUS_WRITE, opcode, slot, I2C_SMBUS_BYTE_DATA, value);
+                if (!NT_SUCCESS(status))
+                {
+                    return status;
+                }
+            }
         }
 
         return STATUS_SUCCESS;
@@ -518,7 +562,7 @@ DEFINE_IOCTL_SIZED(ioctl_smbus_xfer, 5, 5)
     }
 
     new value = 0;
-    status = ReadImcData(offset, read_write, opcode, slot, hstcmd, value);
+    status = ImcAccess(offset, read_write, opcode, slot, hstcmd, value);
     if (!NT_SUCCESS(status))
     {
         return status;
