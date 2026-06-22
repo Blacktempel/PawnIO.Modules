@@ -31,5 +31,8 @@ DEFINE_IOCTL_SIZED(ioctl_query_smm, 6, 6) {
 }
 
 NTSTATUS:main() {
+    if (get_arch() != ARCH_X64)
+        return STATUS_NOT_SUPPORTED;
+
     return STATUS_SUCCESS;
 }
